@@ -65,7 +65,6 @@ macro_rules! make_service {
                         let target = target_host_port_from_connect(&req);
                         match target {
                             Ok((host, port)) => {
-                                println!("HOST: {:?}", host);
                                 let host = "odoh.cloudflare-dns.com".to_string();
                                 // TODO: handle non-encrypted proxying
                                 // TODO: how to handle port != 80/443

@@ -1,16 +1,19 @@
-use std::os::macos::raw;
+use std::convert::TryInto;
 
 use argh::FromArgs;
-use http::header::{self, CONTENT_LENGTH, HOST};
+use http::header::{CONTENT_LENGTH, HOST};
 use http::Request;
 use hyper::{body::Bytes, service::Service};
-use http::{Response, response::Parts};
+use http::Response;
 
 use hyper::Body;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use reqwest::Url;
 use third_wheel::*;
 use odoh_rs::{compose, decrypt_query, parse, ObliviousDoHKeyPair, ObliviousDoHMessage, ObliviousDoHMessageType};
+
+const QUERY_PATH: &str = "/dns-query";
 
 /// Run a TLS mitm proxy that does no modification to the traffic
 #[derive(FromArgs)]
@@ -53,13 +56,17 @@ async fn main() -> Result<(), Error> {
             // Decrypt the query
             let (plaintext, _) = decrypt_query(&query, &key_pair).unwrap();
             let mut comp_dns_msg = plaintext.dns_msg;
-            // comp_dns_msg = [ next_url (32 bytes) | key_id (32 bytes) | encrypted_msg ]
-            let encrypted_msg = comp_dns_msg.split_off(64);
-            let key_id = comp_dns_msg.split_off(32);
-            let next_url = comp_dns_msg.to_vec();
+            // comp_dns_msg = [ next_url_is_proxy (1B) | next_url_len (1B) | next_url (?B) | msg_len (8B) | key_id (32B) | encrypted_msg | dummy ]
             // Reconstruct the next url
-            let next_url_len = next_url[0] as usize;
-            let next_url_str = std::str::from_utf8(&next_url[1..next_url_len + 1]).unwrap();
+            let next_url_is_proxy = comp_dns_msg.split_to(1)[0] == 1;
+            let next_url_len = comp_dns_msg.split_to(1)[0] as usize;
+            let next_url = comp_dns_msg.split_to(next_url_len).to_vec();
+            let next_url_str = std::str::from_utf8(&next_url).unwrap();
+            // Reconstruct the message
+            let key_id = comp_dns_msg.split_to(32);
+            let msg_len = comp_dns_msg.split_to(8).to_vec();
+            let msg_len = u64::from_be_bytes(msg_len.try_into().unwrap()) as usize;
+            let encrypted_msg = comp_dns_msg.split_to(msg_len);
 
             // Reconstruct the query
             let msg = ObliviousDoHMessage {
@@ -67,48 +74,53 @@ async fn main() -> Result<(), Error> {
                 key_id: key_id,
                 encrypted_msg: encrypted_msg
             };
-
             let query_body = compose(&msg).unwrap().freeze();
             println!("PROXY: {}, OLD_LEN: {}, NEW_LEN: {}, TARGET = {}", proxy_label, old_len, query_body.len(), next_url_str);
 
-            // Reconstruct the header to match the new content length
-            // req_parts.headers.insert(HOST, next_url_str.parse().unwrap());
-            // req_parts.headers.insert(CONTENT_LENGTH, query_body.len().to_string().parse().unwrap());
+            // If the next url is a proxy, route it to that proxy
+            let response = if next_url_is_proxy {
+                // Remove constant proxy header
+                req_parts.headers.remove(HOST);
+                req_parts.headers.remove(CONTENT_LENGTH);
 
-            // Remove constant proxy header
-            req_parts.headers.remove(HOST);
-            req_parts.headers.remove(CONTENT_LENGTH);
+                // Send the package to dummy target via another proxy
+                let proxy = reqwest::Proxy::https(next_url_str).unwrap();
+                let client = reqwest::Client::builder()
+                    .proxy(proxy)
+                    .danger_accept_invalid_certs(true)
+                    .build().unwrap();
+                let mut blind = Url::parse("https://www.google.com").unwrap();
+                blind.set_path(QUERY_PATH);
+                let builder = {
+                    client.post(blind).headers(req_parts.headers)
+                };
+                let raw_resp = builder.body(query_body.to_vec()).send().await.unwrap();
+                let status = raw_resp.status();
+                let version = raw_resp.version();
+                let headers = raw_resp.headers().clone();
+                let raw_resp = raw_resp.bytes().await.unwrap();
+                let resp_len = raw_resp.len();
 
-            // Hijack the response by sending it to another proxy
-            let client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build().unwrap();
-            let builder = {
-                client.post(["https://", next_url_str, "/dns-query"].concat()).headers(req_parts.headers)
+                let response = Response::new(Body::from(raw_resp));
+
+                // println!("REP_RAW: {:?}", response);
+                let (mut parts, body) = response.into_parts();
+                parts.status = status;
+                parts.version = version;
+                parts.headers = headers;
+                parts.headers.insert(CONTENT_LENGTH, resp_len.to_string().parse().unwrap());
+                // parts.extensions = raw_resp.extensions().clone();
+                Response::from_parts(parts, body)
+            } 
+            // Otherwise send the message to the target
+            else {
+                // Reconstruct the header to match the new content length
+                req_parts.headers.insert(HOST, next_url_str.parse().unwrap());
+                req_parts.headers.insert(CONTENT_LENGTH, query_body.len().to_string().parse().unwrap());
+                let body = Body::from(query_body);
+                let req = Request::<Body>::from_parts(req_parts, body);
+                third_wheel.call(req).await?
             };
-            let raw_resp = builder.body(query_body.to_vec()).send().await.unwrap();
-            let status = raw_resp.status();
-            let version = raw_resp.version();
-            let headers = raw_resp.headers().clone();
-            let raw_resp = raw_resp.bytes().await.unwrap();
-            let resp_len = raw_resp.len();
-
-            let response = Response::new(Body::from(raw_resp));
-
-            // println!("REP_RAW: {:?}", response);
-            let (mut parts, body) = response.into_parts();
-            parts.status = status;
-            parts.version = version;
-            parts.headers = headers;
-            parts.headers.insert(CONTENT_LENGTH, resp_len.to_string().parse().unwrap());
-            // parts.extensions = raw_resp.extensions().clone();
-            let response = Response::from_parts(parts, body);
-
-            // let body = Body::from(query_body);
-            // let req = Request::<Body>::from_parts(req_parts, body);
-            // let response = third_wheel.call(req).await?;
-            // println!("REP: {:?}\n", response);
-
             Ok(response)
         };
         Box::pin(fut)
