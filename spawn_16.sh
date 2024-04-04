@@ -1,0 +1,16 @@
+cargo run --example podoh_mitm -- -p 8080 &
+cargo run --example podoh_mitm -- -p 8081 &
+cargo run --example podoh_mitm -- -p 8082 &
+cargo run --example podoh_mitm -- -p 8083 &
+cargo run --example podoh_mitm -- -p 8084 &
+cargo run --example podoh_mitm -- -p 8085 &
+cargo run --example podoh_mitm -- -p 8086 &
+cargo run --example podoh_mitm -- -p 8087 &
+cargo run --example podoh_mitm -- -p 8088 &
+cargo run --example podoh_mitm -- -p 8089 &
+cargo run --example podoh_mitm -- -p 8090 &
+cargo run --example podoh_mitm -- -p 8091 &
+cargo run --example podoh_mitm -- -p 8092 &
+cargo run --example podoh_mitm -- -p 8093 &
+cargo run --example podoh_mitm -- -p 8094 &
+cargo run --example podoh_mitm -- -p 8095 &

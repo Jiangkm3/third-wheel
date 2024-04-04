@@ -53,7 +53,7 @@ async fn main() -> Result<(), Error> {
             let (mut req_parts, req_body) = req.into_parts();
 
             // Parse the query
-            let body_bytes = hyper::body::to_bytes(req_body).await?.to_vec();      
+            let body_bytes = hyper::body::to_bytes(req_body).await?.to_vec();
             let mut data: Bytes = body_bytes.into();
             let old_len = data.len();
             let query: ObliviousDoHMessage = parse(&mut data).unwrap();
@@ -95,8 +95,11 @@ async fn main() -> Result<(), Error> {
                     .build().unwrap();
                 let mut blind = Url::parse("https://www.google.com").unwrap();
                 blind.set_path(QUERY_PATH);
-                let reconstr_timer = init_timer.elapsed();
-                println!("CON_TIME: {:.4?}", reconstr_timer);
+                let parse_timer = init_timer.elapsed();
+                println!("PDT: {:.4?}", parse_timer);
+                let parse_timer = format!("{:.4?} + ", parse_timer);
+                let parse_timer_bytes = parse_timer.as_bytes();
+                let mut parse_timer_bytes_len: u8 = parse_timer_bytes.len().try_into().unwrap();
 
                 let builder = {
                     client.post(blind).headers(req_parts.headers)
@@ -106,7 +109,10 @@ async fn main() -> Result<(), Error> {
                 let status = raw_resp.status();
                 let version = raw_resp.version();
                 let headers = raw_resp.headers().clone();
-                let raw_resp = raw_resp.bytes().await.unwrap();
+                let mut raw_resp = raw_resp.bytes().await.unwrap().to_vec();
+                parse_timer_bytes_len += raw_resp[0];
+                // Add parse time to the response message
+                raw_resp = [&[parse_timer_bytes_len], parse_timer_bytes, &raw_resp[1..]].concat().into();
                 let resp_len = raw_resp.len();
 
                 let response = Response::new(Body::from(raw_resp));
@@ -127,9 +133,21 @@ async fn main() -> Result<(), Error> {
                 req_parts.headers.insert(CONTENT_LENGTH, query_body.len().to_string().parse().unwrap());
                 let body = Body::from(query_body);
                 let req = Request::<Body>::from_parts(req_parts, body);
-                let reconstr_timer = init_timer.elapsed();
-                println!("CON_TIME: {:.4?}", reconstr_timer);
-                third_wheel.call(req).await?
+                let parse_timer = init_timer.elapsed();
+                println!("PDT: {:.4?}", parse_timer);
+                let parse_timer = format!("{:.4?}", parse_timer);
+                let parse_timer_bytes = parse_timer.as_bytes();
+                let parse_timer_bytes_len: u8 = parse_timer_bytes.len().try_into().unwrap();
+
+                let response = third_wheel.call(req).await?;
+                
+                let (mut rep_parts, rep_body) = response.into_parts();
+                let body_bytes = hyper::body::to_bytes(rep_body).await?.to_vec();
+                // Add parse time to the response message
+                let raw_resp: Bytes = [&[parse_timer_bytes_len], parse_timer_bytes, &body_bytes].concat().into();
+                let resp_len = raw_resp.len();
+                rep_parts.headers.insert(CONTENT_LENGTH, resp_len.to_string().parse().unwrap());
+                Response::from_parts(rep_parts, Body::from(raw_resp))
             };
             Ok(response)
         };

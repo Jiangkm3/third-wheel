@@ -4,6 +4,7 @@ use hyper::service::Service;
 
 use hyper::Body;
 use third_wheel::*;
+use std::time::Instant;
 
 /// Run a TLS mitm proxy that does no modification to the traffic
 #[derive(FromArgs)]
@@ -31,13 +32,21 @@ async fn main() -> Result<(), Error> {
     )?;
     let trivial_mitm = mitm_layer(|req: Request<Body>, mut third_wheel: ThirdWheel| {
         let fut = async move {
+            let init_timer = Instant::now();
+
             let (req_parts, req_body) = req.into_parts();
 
             // Parse the query
-            let body_bytes = hyper::body::to_bytes(req_body).await?.to_vec();            
+            let body_bytes = hyper::body::to_bytes(req_body).await?.to_vec();
+            let len = body_bytes.len();
+            println!("LEN: {}", len);
+
 
             let body = Body::from(body_bytes);
             let req = Request::<Body>::from_parts(req_parts, body);
+
+            let parse_timer = init_timer.elapsed();
+            println!("PDT: {:.4?}", parse_timer);
             let response = third_wheel.call(req).await?;
             Ok(response)
         };
