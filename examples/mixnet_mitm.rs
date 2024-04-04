@@ -1,5 +1,3 @@
-use std::convert::TryInto;
-
 use argh::FromArgs;
 use http::header::{CONTENT_LENGTH, HOST};
 use http::Request;
@@ -8,14 +6,14 @@ use http::Response;
 
 use hyper::Body;
 use rand::rngs::StdRng;
-use rand::SeedableRng;
+use rand::{RngCore, SeedableRng};
 use reqwest::Url;
 use third_wheel::*;
-use odoh_rs::{compose, decrypt_query, parse, ObliviousDoHKeyPair, ObliviousDoHMessage, ObliviousDoHMessageType};
 
 use std::time::Instant;
 
 const QUERY_PATH: &str = "/dns-query";
+const NUM_PROXIES: usize = 16;
 
 /// Run a TLS mitm proxy that does no modification to the traffic
 #[derive(FromArgs)]
@@ -46,73 +44,45 @@ async fn main() -> Result<(), Error> {
         let proxy_label: u64 = (port - 8080).into();
         let fut = async move {
             let mut rng = StdRng::seed_from_u64(proxy_label);
-            let key_pair = ObliviousDoHKeyPair::new(&mut rng);
-
             let init_timer = Instant::now();
 
             let (mut req_parts, req_body) = req.into_parts();
 
             // Parse the query
-            let body_bytes = hyper::body::to_bytes(req_body).await?.to_vec();
-            let mut data: Bytes = body_bytes.into();
-            let old_len = data.len();
-            let query: ObliviousDoHMessage = parse(&mut data).unwrap();
-            // Decrypt the query
-            let (plaintext, _) = decrypt_query(&query, &key_pair).unwrap();
-            let mut comp_dns_msg = plaintext.dns_msg;
-            // comp_dns_msg = [ next_url_is_proxy (1B) | next_url_len (1B) | next_url (?B) | msg_len (8B) | key_id (32B) | encrypted_msg | dummy ]
-            // Reconstruct the next url
-            let next_url_is_proxy = comp_dns_msg.split_to(1)[0] == 1;
-            let next_url_len = comp_dns_msg.split_to(1)[0] as usize;
-            let next_url = comp_dns_msg.split_to(next_url_len).to_vec();
-            let next_url_str = std::str::from_utf8(&next_url).unwrap();
-            // Reconstruct the message
-            let key_id = comp_dns_msg.split_to(32);
-            let msg_len = comp_dns_msg.split_to(8).to_vec();
-            let msg_len = u64::from_be_bytes(msg_len.try_into().unwrap()) as usize;
-            let encrypted_msg = comp_dns_msg.split_to(msg_len);
-
-            // Reconstruct the query
-            let msg = ObliviousDoHMessage {
-                msg_type: ObliviousDoHMessageType::Query,
-                key_id: key_id,
-                encrypted_msg: encrypted_msg
-            };
-            let query_body = compose(&msg).unwrap().freeze();
-            // println!("PROXY: {}, OLD_LEN: {}, NEW_LEN: {}, TARGET = {}", proxy_label, old_len, query_body.len(), next_url_str);
+            let mut body_bytes = hyper::body::to_bytes(req_body).await?.to_vec();
+            let num_hops_remaining = body_bytes[0] - 1;
+            body_bytes[0] = num_hops_remaining;
+            let mut query_body: Bytes = body_bytes.into();
 
             // If the next url is a proxy, route it to that proxy
-            let response = if next_url_is_proxy {
+            let response = if num_hops_remaining > 0 {
                 // Remove constant proxy header
                 req_parts.headers.remove(HOST);
                 req_parts.headers.remove(CONTENT_LENGTH);
 
+                // Sample the next proxy
+                let next_proxy = format!("http://localhost:{}", 8080 + rng.next_u32() as usize % NUM_PROXIES);
+
                 // Send the package to dummy target via another proxy
-                let proxy = reqwest::Proxy::https(next_url_str).unwrap();
+                let proxy = reqwest::Proxy::https(next_proxy).unwrap();
                 let client = reqwest::Client::builder()
                     .proxy(proxy)
                     .danger_accept_invalid_certs(true)
                     .build().unwrap();
-                let mut blind = Url::parse("https://www.google.com").unwrap();
+                let mut blind = Url::parse("https://odoh.cloudflare-dns.com").unwrap();
                 blind.set_path(QUERY_PATH);
                 let parse_timer = init_timer.elapsed();
                 println!("PDT: {:.4?}", parse_timer);
-                let parse_timer = format!("{:.4?} + ", parse_timer);
-                let parse_timer_bytes = parse_timer.as_bytes();
-                let mut parse_timer_bytes_len: u8 = parse_timer_bytes.len().try_into().unwrap();
 
                 let builder = {
                     client.post(blind).headers(req_parts.headers)
                 };
 
-                let raw_resp = builder.body(query_body.to_vec()).send().await.unwrap();
+                let raw_resp = builder.body(query_body).send().await.unwrap();
                 let status = raw_resp.status();
                 let version = raw_resp.version();
                 let headers = raw_resp.headers().clone();
-                let mut raw_resp = raw_resp.bytes().await.unwrap().to_vec();
-                parse_timer_bytes_len += raw_resp[0];
-                // Add parse time to the response message
-                raw_resp = [&[parse_timer_bytes_len], parse_timer_bytes, &raw_resp[1..]].concat().into();
+                let raw_resp = raw_resp.bytes().await.unwrap().to_vec();
                 let resp_len = raw_resp.len();
 
                 let response = Response::new(Body::from(raw_resp));
@@ -128,23 +98,20 @@ async fn main() -> Result<(), Error> {
             } 
             // Otherwise send the message to the target
             else {
-                // Reconstruct the header to match the new content length
-                req_parts.headers.insert(HOST, next_url_str.parse().unwrap());
+                let _ = query_body.split_to(1);
                 req_parts.headers.insert(CONTENT_LENGTH, query_body.len().to_string().parse().unwrap());
+                
                 let body = Body::from(query_body);
                 let req = Request::<Body>::from_parts(req_parts, body);
                 let parse_timer = init_timer.elapsed();
                 println!("PDT: {:.4?}", parse_timer);
-                let parse_timer = format!("{:.4?}", parse_timer);
-                let parse_timer_bytes = parse_timer.as_bytes();
-                let parse_timer_bytes_len: u8 = parse_timer_bytes.len().try_into().unwrap();
 
                 let response = third_wheel.call(req).await?;
                 
                 let (mut rep_parts, rep_body) = response.into_parts();
                 let body_bytes = hyper::body::to_bytes(rep_body).await?.to_vec();
                 // Add parse time to the response message
-                let raw_resp: Bytes = [&[parse_timer_bytes_len], parse_timer_bytes, &body_bytes].concat().into();
+                let raw_resp: Bytes = body_bytes.into();
                 let resp_len = raw_resp.len();
                 rep_parts.headers.insert(CONTENT_LENGTH, resp_len.to_string().parse().unwrap());
                 Response::from_parts(rep_parts, Body::from(raw_resp))
