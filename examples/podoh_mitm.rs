@@ -13,6 +13,8 @@ use reqwest::Url;
 use third_wheel::*;
 use odoh_rs::{compose, decrypt_query, parse, ObliviousDoHKeyPair, ObliviousDoHMessage, ObliviousDoHMessageType};
 
+use std::time::Instant;
+
 const QUERY_PATH: &str = "/dns-query";
 
 /// Run a TLS mitm proxy that does no modification to the traffic
@@ -45,6 +47,8 @@ async fn main() -> Result<(), Error> {
         let fut = async move {
             let mut rng = StdRng::seed_from_u64(proxy_label);
             let key_pair = ObliviousDoHKeyPair::new(&mut rng);
+
+            let init_timer = Instant::now();
 
             let (mut req_parts, req_body) = req.into_parts();
 
@@ -91,9 +95,13 @@ async fn main() -> Result<(), Error> {
                     .build().unwrap();
                 let mut blind = Url::parse("https://www.google.com").unwrap();
                 blind.set_path(QUERY_PATH);
+                let reconstr_timer = init_timer.elapsed();
+                println!("CON_TIME: {:.4?}", reconstr_timer);
+
                 let builder = {
                     client.post(blind).headers(req_parts.headers)
                 };
+
                 let raw_resp = builder.body(query_body.to_vec()).send().await.unwrap();
                 let status = raw_resp.status();
                 let version = raw_resp.version();
@@ -119,6 +127,8 @@ async fn main() -> Result<(), Error> {
                 req_parts.headers.insert(CONTENT_LENGTH, query_body.len().to_string().parse().unwrap());
                 let body = Body::from(query_body);
                 let req = Request::<Body>::from_parts(req_parts, body);
+                let reconstr_timer = init_timer.elapsed();
+                println!("CON_TIME: {:.4?}", reconstr_timer);
                 third_wheel.call(req).await?
             };
             Ok(response)
