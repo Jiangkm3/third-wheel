@@ -65,6 +65,8 @@ macro_rules! make_service {
                         let target = target_host_port_from_connect(&req);
                         match target {
                             Ok((host, port)) => {
+                                println!("HOST: {:?}", host);
+                                let host = "odoh.cloudflare-dns.com".to_string();
                                 // TODO: handle non-encrypted proxying
                                 // TODO: how to handle port != 80/443
                                 // In the case of a TLS tunnel request we spawn a new
@@ -337,7 +339,7 @@ async fn connect_to_target_with_tls(
 
     let tokio_connector = tokio_native_tls::TlsConnector::from(connector);
     let target_stream = tokio_connector.connect(host, target_stream).await?;
-    //TODO: Currently to copy the certificate we do a round trip from one library -> der -> other library. This is inefficient, it should be possible to do it better some how.
+    // TODO: Currently to copy the certificate we do a round trip from one library -> der -> other library. This is inefficient, it should be possible to do it better some how.
     let certificate = &target_stream.get_ref().peer_certificate()?;
 
     let certificate = match certificate {

@@ -29,8 +29,20 @@ async fn main() -> Result<(), Error> {
         &args.key_file,
         "third-wheel",
     )?;
-    let trivial_mitm =
-        mitm_layer(|req: Request<Body>, mut third_wheel: ThirdWheel| third_wheel.call(req));
+    let trivial_mitm = mitm_layer(|req: Request<Body>, mut third_wheel: ThirdWheel| {
+        let fut = async move {
+            let (req_parts, req_body) = req.into_parts();
+
+            // Parse the query
+            let body_bytes = hyper::body::to_bytes(req_body).await?.to_vec();            
+
+            let body = Body::from(body_bytes);
+            let req = Request::<Body>::from_parts(req_parts, body);
+            let response = third_wheel.call(req).await?;
+            Ok(response)
+        };
+        Box::pin(fut)
+    });
     let mitm_proxy = MitmProxy::builder(trivial_mitm, ca).build();
     let (_, mitm_proxy_fut) = mitm_proxy.bind(format!("127.0.0.1:{}", args.port).parse().unwrap());
     mitm_proxy_fut.await.unwrap();
